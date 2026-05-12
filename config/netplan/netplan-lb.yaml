@@ -1,0 +1,11 @@
+network:
+  version: 2
+  ethernets:
+    enp6s18:
+      dhcp4: true
+    enp6s19:
+      addresses:
+        - 10.20.20.1/24
+    enp6s20:
+      addresses:
+        - 10.30.30.2/24

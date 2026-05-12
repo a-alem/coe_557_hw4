@@ -1,0 +1,11 @@
+services:
+  ryu-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ryu-controller
+    restart: unless-stopped
+    ports:
+      - "6653:6653"
+    volumes:
+      - ./ryu-controller.py:/app/ryu-controller.py:ro
