@@ -1,198 +1,126 @@
-import ipaddress
-import time
+#!/usr/bin/env python3
 
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
-from ryu.lib.packet import packet, ethernet, ether_types, ipv4, arp
-from ryu.ofproto import ofproto_v1_3
+import subprocess
+import sys
+
+from mininet.net import Mininet
+from mininet.node import RemoteController, OVSSwitch
+from mininet.link import TCLink
+from mininet.cli import CLI
+from mininet.log import setLogLevel, info
 
 
-class ServiceChainController(app_manager.RyuApp):
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+VM_BRIDGE = "vmbr10"
+VETH_MN = "veth-mn"
+VETH_PVE = "veth-pve"
 
-    CLIENT_NET = ipaddress.ip_network("10.10.10.0/24")
-    BACKEND_NET = ipaddress.ip_network("10.20.20.0/24")
-    FIREWALL_IP = "10.10.10.1"
 
-    def __init__(self, *args, **kwargs):
-        super(ServiceChainController, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-        self.packet_count = 0
-        self.flow_count = {}
+def run_cmd(cmd, check=True):
+    info(f"*** Running: {' '.join(cmd)}\n")
+    return subprocess.run(cmd, check=check)
 
-    def add_flow(self, datapath, priority, match, actions, idle_timeout=30, hard_timeout=0):
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
 
-        inst = [
-            parser.OFPInstructionActions(
-                ofproto.OFPIT_APPLY_ACTIONS,
-                actions
-            )
-        ]
+def setup_external_veth():
+    info("*** Cleaning old veth pair if it exists\n")
+    run_cmd(["ip", "link", "del", VETH_MN], check=False)
 
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=priority,
-            match=match,
-            instructions=inst,
-            idle_timeout=idle_timeout,
-            hard_timeout=hard_timeout,
-        )
+    info("*** Creating external veth pair\n")
+    run_cmd(["ip", "link", "add", VETH_MN, "type", "veth", "peer", "name", VETH_PVE])
 
-        datapath.send_msg(mod)
+    info(f"*** Attaching {VETH_PVE} to {VM_BRIDGE}\n")
+    run_cmd(["ip", "link", "set", VETH_PVE, "master", VM_BRIDGE])
 
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
+    run_cmd(["ip", "link", "set", VETH_PVE, "up"])
+    run_cmd(["ip", "link", "set", VETH_MN, "up"])
 
-        # Table-miss: send unknown packets to controller
-        match = parser.OFPMatch()
-        actions = [
-            parser.OFPActionOutput(
-                ofproto.OFPP_CONTROLLER,
-                ofproto.OFPCML_NO_BUFFER,
-            )
-        ]
 
-        self.add_flow(
-            datapath=datapath,
-            priority=0,
-            match=match,
-            actions=actions,
-            idle_timeout=0,
-        )
+def attach_veth_to_ovs(switch_name):
+    info(f"*** Attaching {VETH_MN} to OVS switch {switch_name}\n")
 
-        # Proactive SDN firewall rule:
-        # Clients must not directly access backend subnet.
-        # Traffic must go through Firewall -> LB -> Servers.
-        backend_block_match = parser.OFPMatch(
-            eth_type=ether_types.ETH_TYPE_IP,
-            ipv4_src=("10.10.10.0", "255.255.255.0"),
-            ipv4_dst=("10.20.20.0", "255.255.255.0"),
-        )
+    run_cmd([
+        "ovs-vsctl",
+        "--may-exist",
+        "add-port",
+        switch_name,
+        VETH_MN,
+    ])
 
-        self.add_flow(
-            datapath=datapath,
-            priority=200,
-            match=backend_block_match,
-            actions=[],
-            idle_timeout=0,
-        )
+    run_cmd(["ip", "link", "set", VETH_MN, "up"])
 
-        self.logger.info("Switch connected. Table-miss and backend-block rules installed.")
+    info("*** Current OVS ports:\n")
+    subprocess.run(["ovs-vsctl", "list-ports", switch_name], check=False)
 
-    def is_client_to_backend(self, src_ip, dst_ip):
-        try:
-            src = ipaddress.ip_address(src_ip)
-            dst = ipaddress.ip_address(dst_ip)
-            return src in self.CLIENT_NET and dst in self.BACKEND_NET
-        except ValueError:
-            return False
 
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
-        start_time = time.time()
-        self.packet_count += 1
+def run():
+    setup_external_veth()
 
-        msg = ev.msg
-        datapath = msg.datapath
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        in_port = msg.match["in_port"]
+    net = Mininet(
+        controller=RemoteController,
+        switch=OVSSwitch,
+        link=TCLink,
+        autoSetMacs=True,
+        build=False,
+    )
 
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocol(ethernet.ethernet)
+    info("*** Adding controller\n")
+    c0 = net.addController(
+        "c0",
+        controller=RemoteController,
+        ip="127.0.0.1",
+        port=6653,
+    )
 
-        if eth is None:
-            return
+    info("*** Adding OpenFlow switch\n")
+    s1 = net.addSwitch("s1", protocols="OpenFlow13")
 
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            return
+    info("*** Adding client hosts\n")
+    h1 = net.addHost(
+        "h1",
+        ip="10.10.10.10/24",
+        defaultRoute="via 10.10.10.1",
+    )
 
-        dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
+    h2 = net.addHost(
+        "h2",
+        ip="10.10.10.11/24",
+        defaultRoute="via 10.10.10.1",
+    )
 
-        src_mac = eth.src
-        dst_mac = eth.dst
+    info("*** Adding links\n")
+    net.addLink(h1, s1)
+    net.addLink(h2, s1)
 
-        self.mac_to_port[dpid][src_mac] = in_port
+    info("*** Building network\n")
+    net.build()
 
-        arp_pkt = pkt.get_protocol(arp.arp)
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+    info("*** Starting controller and switch\n")
+    c0.start()
+    s1.start([c0])
 
-        if arp_pkt:
-            self.logger.info(
-                "ARP packet #%d: src_mac=%s dst_mac=%s in_port=%s",
-                self.packet_count,
-                src_mac,
-                dst_mac,
-                in_port,
-            )
+    attach_veth_to_ovs("s1")
 
-        if ip_pkt:
-            src_ip = ip_pkt.src
-            dst_ip = ip_pkt.dst
+    info("*** Network ready\n")
+    info("*** Test commands:\n")
+    info("    sh ovs-vsctl list-ports s1\n")
+    info("    h1 ping -c 3 10.10.10.1\n")
+    info("    h1 curl http://10.10.10.1\n")
+    info("    h1 curl --connect-timeout 3 http://10.20.20.11\n")
+    info("    h1 iperf3 -c 10.10.10.1 -p 5201 -t 10\n")
 
-            flow_key = f"{src_ip}->{dst_ip}"
-            self.flow_count[flow_key] = self.flow_count.get(flow_key, 0) + 1
+    CLI(net)
 
-            self.logger.info(
-                "IPv4 packet #%d: %s -> %s, flow_packets=%d",
-                self.packet_count,
-                src_ip,
-                dst_ip,
-                self.flow_count[flow_key],
-            )
+    info("*** Stopping network\n")
+    net.stop()
 
-            # Runtime safety check in addition to proactive drop rule
-            if self.is_client_to_backend(src_ip, dst_ip):
-                self.logger.warning(
-                    "BLOCKED bypass attempt: client %s tried direct access to backend %s",
-                    src_ip,
-                    dst_ip,
-                )
-                return
+    info("*** Cleaning external veth pair\n")
+    run_cmd(["ip", "link", "del", VETH_MN], check=False)
 
-        # L2 forwarding
-        if dst_mac in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst_mac]
-        else:
-            out_port = ofproto.OFPP_FLOOD
 
-        actions = [
-            parser.OFPActionOutput(out_port)
-        ]
+if __name__ == "__main__":
+    setLogLevel("info")
 
-        # Install learning flow only after policy checks
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(
-                in_port=in_port,
-                eth_src=src_mac,
-                eth_dst=dst_mac,
-            )
+    if subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip() != "0":
+        print("Please run with sudo.")
+        sys.exit(1)
 
-            self.add_flow(
-                datapath=datapath,
-                priority=10,
-                match=match,
-                actions=actions,
-                idle_timeout=30,
-            )
-
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data,
-        )
-
-        datapath.send_msg(out)
-
-        decision_time_ms = (time.time() - start_time) * 1000
-        self.logger.info("Controller decision time: %.3f ms", decision_time_ms)
+    run()
